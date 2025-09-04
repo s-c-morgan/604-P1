@@ -535,3 +535,250 @@ if(compound_col %in% colnames(df) && "Metadata_Object_Count" %in% colnames(df)) 
     cat("Error: Metadata_Object_Count column not found in dataset\n")
   }
 }
+
+# ------- 7 plates separately; raw, mean, sd, standardize by site ------     
+{
+  suppressPackageStartupMessages({
+    library(dplyr); library(tidyr); library(ggplot2); library(stringr)
+  })
+  
+  # =========================
+  # Config
+  # =========================
+  # ============================================================================
+  site_to_plot    <- "FMP"     # <-- change to the site you want
+  # ============================================================================
+  plates_per_site <- 7
+  reps_per_site   <- 4
+  rep_levels      <- paste0("R", 1:reps_per_site)
+  
+  controls <- c("DMSO", "Nocodazole", "Tetrandrine")
+  control_color_map <- c("DMSO"="green","Nocodazole"="purple","Tetrandrine"="red",
+                         "Other"="grey80","Missing"="black")
+  missing_fill_color <- "grey30"
+  tile_border_width  <- 0.25
+  
+  # =========================
+  # Checks
+  # =========================
+  stopifnot(exists("df"))
+  req_cols <- c("Metadata_Site","Metadata_Row","Metadata_Col",
+                "Metadata_Object_Count","Metadata_Compound_type")
+  miss <- setdiff(req_cols, names(df))
+  if (length(miss)) stop("Missing cols: ", paste(miss, collapse=", "))
+  
+  # Pick your plate column (edit if needed)
+  plate_col <- c("Metadata_Unique_plate","Metadata_Plate_num","Metadata_Plate",
+                 "Plate","PlateID","Barcode","Metadata_Barcode")
+  plate_col <- plate_col[plate_col %in% names(df)][1]
+  if (is.na(plate_col)) stop("Set `plate_col` to your plate ID column.")
+  
+  # =========================
+  # Parse Plate & Replicate from plate string
+  # =========================
+  df_parsed <- df %>%
+    mutate(
+      Metadata_Row = as.character(Metadata_Row),
+      Metadata_Col = suppressWarnings(as.numeric(Metadata_Col)),
+      PlateRaw     = as.character(.data[[plate_col]]),
+      .rep_digit   = str_match(PlateRaw, "(?i)(?:^|[_-])R\\s*([1-4])$")[,2],
+      Replicate    = ifelse(!is.na(.rep_digit), paste0("R", str_trim(.rep_digit)), NA_character_),
+      Plate        = ifelse(!is.na(Replicate),
+                            str_replace(PlateRaw, "(?i)[_-]R\\s*[1-4]$", ""),
+                            PlateRaw)
+    ) %>%
+    select(-.rep_digit) %>%
+    filter(!is.na(Metadata_Col), Metadata_Col>=1, Metadata_Col<=24,
+           Metadata_Row %in% LETTERS[1:16])
+  
+  to_well_coords <- function(d) d %>% mutate(Row_Num = match(Metadata_Row, LETTERS[1:16]),
+                                             Col_Num = Metadata_Col)
+  
+  # Plate order helper (within THIS site)
+  plate_order_for_site <- function(site_name) {
+    p <- df_parsed %>% filter(Metadata_Site==site_name) %>% distinct(Plate) %>% pull(Plate)
+    if (!length(p)) return(character(0))
+    num <- suppressWarnings(as.numeric(str_extract(p, "\\d+")))
+    p[order(is.na(num), num, p)]
+  }
+  
+  # =========================
+  # Build complete **4 × 7** layout for ONE site
+  # =========================
+  build_site_grid <- function(site_name) {
+    wells <- expand_grid(Metadata_Row=LETTERS[1:16], Metadata_Col=1:24)
+    
+    # pick exactly 7 plates (pad with placeholders if fewer exist)
+    p_order <- plate_order_for_site(site_name)
+    sel_plates <- head(p_order, plates_per_site)
+    if (length(sel_plates) < plates_per_site) {
+      sel_plates <- c(sel_plates,
+                      paste0("MISSING_PLATE_", seq_len(plates_per_site - length(sel_plates))))
+    }
+    
+    # skeleton: 7 plates × 4 reps × wells
+    skel <- expand_grid(
+      Metadata_Site = site_name,
+      Plate         = sel_plates,
+      Replicate     = rep_levels
+    ) %>%
+      crossing(wells) %>%
+      to_well_coords() %>%
+      mutate(
+        PlateColIdx = match(Plate, sel_plates),          # columns = plates
+        RepRowIdx   = match(Replicate, rep_levels),      # rows    = replicates
+        PlateFacet  = factor(sprintf("Plate %d\n%s", PlateColIdx, Plate),
+                             levels = sprintf("Plate %d\n%s", 1:plates_per_site, sel_plates)),
+        RepFacet    = factor(sprintf("Rep %d\n%s", RepRowIdx, Replicate),
+                             levels = sprintf("Rep %d\n%s", 1:reps_per_site, rep_levels))
+      )
+    
+    # actual averages and dominant control (filtered to this site)
+    dat <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      summarise(avg_cell_count=mean(Metadata_Object_Count, na.rm=TRUE), .groups="drop")
+    
+    ctrl <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+      summarise(n=dplyr::n(), .groups="drop") %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      slice_max(order_by=n, n=1, with_ties=FALSE) %>%
+      ungroup() %>%
+      mutate(control_label = ifelse(Metadata_Compound_type %in% controls,
+                                    Metadata_Compound_type, "Other")) %>%
+      select(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, control_label)
+    
+    merged <- skel %>%
+      left_join(dat,  by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col")) %>%
+      left_join(ctrl, by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col"))
+    
+    if (!"control_label" %in% names(merged)) merged$control_label <- NA_character_
+    
+    merged %>%
+      mutate(
+        is_missing    = is.na(avg_cell_count),
+        control_label = ifelse(is_missing, "Missing", control_label)
+        # keep avg_cell_count = NA so fill uses `missing_fill_color`
+      )
+  }
+  
+  site_df <- build_site_grid(site_to_plot)
+  
+  # =========================
+  # 1) RAW (single site) — **4 × 7** (rows = replicates, cols = plates)
+  # =========================
+  p_raw <- ggplot(site_df, aes(x=Col_Num, y=Row_Num)) +
+    geom_tile(aes(fill=avg_cell_count, color=control_label), linewidth=tile_border_width) +
+    facet_grid(RepFacet ~ PlateFacet, switch="y", drop=FALSE) +   # <<< 4 × 7 layout
+    scale_fill_gradient(low="blue", high="red", name="Avg cell count",
+                        na.value=missing_fill_color) +
+    scale_color_manual(values=control_color_map, drop=FALSE, name="Border") +
+    scale_x_continuous(breaks=seq(1,24,4), expand=c(0,0)) +
+    scale_y_continuous(breaks=seq(1,16,2), labels=LETTERS[seq(1,16,2)],
+                       trans="reverse", expand=c(0,0)) +
+    labs(
+      title=paste0("RAW — Site: ", site_to_plot, "  (4 Replicates × 7 Plates)"),
+      subtitle="Missing plate–replicate wells are shaded in a distinct color; borders show control type",
+      x="Column", y="Row"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title=element_text(hjust=0.5, face="bold"),
+          panel.grid=element_blank(),
+          strip.text=element_text(face="bold")) +
+    coord_fixed()
+  print(p_raw)
+  
+  # =========================
+  # 2) AVG across replicates (single site) — **1 × 7** (one row, 7 columns)
+  # =========================
+  avg_site <- site_df %>%
+    group_by(Metadata_Site, Plate, PlateFacet, Metadata_Row, Metadata_Col, Row_Num, Col_Num) %>%
+    summarise(avg_over_reps = mean(avg_cell_count, na.rm=TRUE), .groups="drop")
+  
+  p_avg <- ggplot(avg_site, aes(x=Col_Num, y=Row_Num, fill=avg_over_reps)) +
+    geom_tile(color="white", linewidth=tile_border_width) +
+    facet_grid(. ~ PlateFacet, switch="y", drop=FALSE) +          # <<< 1 × 7
+    scale_fill_gradient(low="blue", high="red", name="Avg over reps",
+                        na.value=missing_fill_color) +
+    scale_x_continuous(breaks=seq(1,24,4), expand=c(0,0)) +
+    scale_y_continuous(breaks=seq(1,16,2), labels=LETTERS[seq(1,16,2)],
+                       trans="reverse", expand=c(0,0)) +
+    labs(
+      title=paste0("AVG across replicates — Site: ", site_to_plot),
+      subtitle="One row × 7 plates; grey indicates missing",
+      x="Column", y="Row"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title=element_text(hjust=0.5, face="bold"),
+          panel.grid=element_blank(),
+          strip.text=element_text(face="bold")) +
+    coord_fixed()
+  print(p_avg)
+  
+  # =========================
+  # 3) NORMALIZED (per-site z-score of AVG) — **1 × 7**
+  # =========================
+  # -------- NORMALIZED (per-site z-score of AVG) — robust against SD == 0/NA -----
+  # avg_site is the 7×1 dataset built just above (per-plate, per-well averages)
+  
+  # Helper: safe z-score on a numeric vector
+  safe_z <- function(x) {
+    m <- mean(x, na.rm = TRUE)
+    s <- sd(x, na.rm = TRUE)
+    if (!is.finite(s) || s <= 0) {
+      # fall back to mean-centering so we still see structure
+      return(x - m)
+    }
+    (x - m) / s
+  }
+  
+  # Compute z per site (single site selected upstream)
+  avg_norm <- avg_site %>%
+    mutate(z_over_reps = safe_z(avg_over_reps))
+  
+  # Optional: sanity printout
+  site_stats <- avg_site %>%
+    summarise(
+      n_non_na = sum(!is.na(avg_over_reps)),
+      site_mean = mean(avg_over_reps, na.rm = TRUE),
+      site_sd   = sd  (avg_over_reps, na.rm = TRUE)
+    )
+  print(site_stats)
+  
+  # Plot (unchanged layout: 1 × 7)
+  p_norm <- ggplot(avg_norm, aes(x = Col_Num, y = Row_Num, fill = z_over_reps)) +
+    geom_tile(color = "white", linewidth = tile_border_width) +
+    facet_grid(. ~ PlateFacet, switch = "y", drop = FALSE) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0,
+      name = "Z-score (AVG)", na.value = missing_fill_color
+    ) +
+    scale_x_continuous(breaks = seq(1, 24, 4), expand = c(0, 0)) +
+    scale_y_continuous(
+      breaks = seq(1, 16, 2),
+      labels = LETTERS[seq(1, 16, 2)],
+      trans  = "reverse", expand = c(0, 0)
+    ) +
+    labs(
+      title = paste0("NORMALIZED (Z-score of AVG) — Site: ", site_to_plot),
+      subtitle = "Per-site z = (AVG − mean)/sd; falls back to mean-centering if sd ≤ 0 or NA",
+      x = "Column", y = "Row"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) +
+    coord_fixed()
+  
+  print(p_norm)
+  
+  
+}
+
+
+
+
