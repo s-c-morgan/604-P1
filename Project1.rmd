@@ -18,6 +18,10 @@ if (!require(dplyr)) install.packages("dplyr")
 library(dplyr)
 if (!require(ggplot2)) install.packages("ggplot2")
 library(ggplot2)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(stringr); library(ggplot2); library(forcats)
+})
+
 ```
 
 ## Initial Data Structure
@@ -37,68 +41,177 @@ cat("Measurement columns:", length(measurement_cols), "\n")
 
 *Insert analysis here*
 
-## Missing Data Analysis
+## Recover the data structure
 
 ```{r missing-data-analysis}
-# MISSING DATA ANALYSIS
-cat("\n=== MISSING DATA ANALYSIS ===\n")
+  plates_per_site <- 7
+  reps_per_site   <- 4
+  rep_levels      <- paste0("R", 1:reps_per_site)
+  
+  controls <- c("DMSO", "Nocodazole", "Tetrandrine")
+  control_color_map <- c("DMSO"="green","Nocodazole"="purple","Tetrandrine"="red",
+                         "Other"="grey80","Missing"="black")
+  missing_fill_color <- "grey30"
+  tile_border_width  <- 0.25
+  
+  # =========================
+  # Checks
+  # =========================
+  stopifnot(exists("df"))
+  req_cols <- c("Metadata_Site","Metadata_Row","Metadata_Col",
+                "Metadata_Object_Count","Metadata_Compound_type")
+  miss <- setdiff(req_cols, names(df))
+  if (length(miss)) stop("Missing cols: ", paste(miss, collapse=", "))
+  
+  # Pick your plate column (edit if needed)
+  plate_col <- c("Metadata_Unique_plate","Metadata_Plate_num","Metadata_Plate",
+                 "Plate","PlateID","Barcode","Metadata_Barcode")
+  plate_col <- plate_col[plate_col %in% names(df)][1]
+  if (is.na(plate_col)) stop("Set `plate_col` to your plate ID column.")
+  
+  # =========================
+  # Parse Plate & Replicate from plate string
+  # =========================
+  df_parsed <- df %>%
+    mutate(
+      Metadata_Row = as.character(Metadata_Row),
+      Metadata_Col = suppressWarnings(as.numeric(Metadata_Col)),
+      PlateRaw     = as.character(.data[[plate_col]]),
+      .rep_digit   = str_match(PlateRaw, "(?i)(?:^|[_-])R\\s*([1-4])$")[,2],
+      Replicate    = ifelse(!is.na(.rep_digit), paste0("R", str_trim(.rep_digit)), NA_character_),
+      Plate        = ifelse(!is.na(Replicate),
+                            str_replace(PlateRaw, "(?i)[_-]R\\s*[1-4]$", ""),
+                            PlateRaw)
+    ) %>%
+    select(-.rep_digit) %>%
+    filter(!is.na(Metadata_Col), Metadata_Col>=1, Metadata_Col<=24,
+           Metadata_Row %in% LETTERS[1:16])
+  
+  to_well_coords <- function(d) d %>% mutate(Row_Num = match(Metadata_Row, LETTERS[1:16]),
+                                             Col_Num = Metadata_Col)
+  
+  # Plate order helper (within THIS site)
+  plate_order_for_site <- function(site_name) {
+    p <- df_parsed %>% filter(Metadata_Site==site_name) %>% distinct(Plate) %>% pull(Plate)
+    if (!length(p)) return(character(0))
+    num <- suppressWarnings(as.numeric(str_extract(p, "\\d+")))
+    p[order(is.na(num), num, p)]
+  }
+  
+  # =========================
+  # Build complete **4 × 7** layout for ONE site
+  # =========================
+  build_site_grid <- function(site_name) {
+    wells <- expand_grid(Metadata_Row=LETTERS[1:16], Metadata_Col=1:24)
+    
+    # pick exactly 7 plates (pad with placeholders if fewer exist)
+    p_order <- plate_order_for_site(site_name)
+    sel_plates <- head(p_order, plates_per_site)
+    if (length(sel_plates) < plates_per_site) {
+      sel_plates <- c(sel_plates,
+                      paste0("MISSING_PLATE_", seq_len(plates_per_site - length(sel_plates))))
+    }
+    
+    # skeleton: 7 plates × 4 reps × wells
+    skel <- expand_grid(
+      Metadata_Site = site_name,
+      Plate         = sel_plates,
+      Replicate     = rep_levels
+    ) %>%
+      crossing(wells) %>%
+      to_well_coords() %>%
+      mutate(
+        PlateColIdx = match(Plate, sel_plates),          # columns = plates
+        RepRowIdx   = match(Replicate, rep_levels),      # rows    = replicates
+        PlateFacet  = factor(sprintf("Plate %d\n%s", PlateColIdx, Plate),
+                             levels = sprintf("Plate %d\n%s", 1:plates_per_site, sel_plates)),
+        RepFacet    = factor(sprintf("Rep %d\n%s", RepRowIdx, Replicate),
+                             levels = sprintf("Rep %d\n%s", 1:reps_per_site, rep_levels))
+      )
+    
+    # actual averages and dominant control (filtered to this site)
+    dat <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      summarise(avg_cell_count=mean(Metadata_Object_Count, na.rm=TRUE), .groups="drop")
+    
+    ctrl <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+      summarise(n=dplyr::n(), .groups="drop") %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      slice_max(order_by=n, n=1, with_ties=FALSE) %>%
+      ungroup() %>%
+      mutate(control_label = ifelse(Metadata_Compound_type %in% controls,
+                                    Metadata_Compound_type, "Other")) %>%
+      select(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, control_label)
+    
+    merged <- skel %>%
+      left_join(dat,  by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col")) %>%
+      left_join(ctrl, by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col"))
+    
+    if (!"control_label" %in% names(merged)) merged$control_label <- NA_character_
+    
+    merged %>%
+      mutate(
+        is_missing    = is.na(avg_cell_count),
+        control_label = ifelse(is_missing, "Missing", control_label)
+        # keep avg_cell_count = NA so fill uses `missing_fill_color`
+      )
+  }
+  
+  site_df <- build_site_grid(site_to_plot)
+  
 
-# Count missing values by column
-missing_counts <- sapply(df, function(x) sum(is.na(x)))
-missing_percentages <- sapply(df, function(x) round(sum(is.na(x))/length(x) * 100, 2))
-
-# Create missing data summary
-missing_summary <- data.frame(
-  Column = names(missing_counts),
-  Missing_Count = missing_counts,
-  Missing_Percentage = missing_percentages,
-  Total_Rows = nrow(df),
-  stringsAsFactors = FALSE
-)
-
-# Sort by missing percentage (descending)
-missing_summary <- missing_summary[order(missing_summary$Missing_Percentage, decreasing = TRUE), ]
-
-# Overall missing data statistics
-total_cells <- nrow(df) * ncol(df)
-total_missing <- sum(missing_counts)
-overall_missing_pct <- round(total_missing / total_cells * 100, 2)
-
-cat("Overall missing data statistics:\n")
-cat("  Total cells:", total_cells, "\n")
-cat("  Total missing:", total_missing, "\n")
-cat("  Overall missing percentage:", overall_missing_pct, "%\n\n")
 ```
 
 *Insert analysis here*
 
-## Missing Data by Column Type
+## Missing Data Count
 
 ```{r missing-data-by-type}
-# Show columns with missing data
-cols_with_missing <- missing_summary[missing_summary$Missing_Count > 0, ]
-if(nrow(cols_with_missing) > 0) {
-  cat("Columns with missing data:\n")
-  print(cols_with_missing, row.names = FALSE)
-  
-  # Separate analysis for metadata vs measurement columns
-  metadata_missing <- cols_with_missing[grepl("^Metadata_", cols_with_missing$Column), ]
-  measurement_missing <- cols_with_missing[!grepl("^Metadata_", cols_with_missing$Column), ]
-  
-  cat("\nMetadata columns with missing data:", nrow(metadata_missing), "\n")
-  if(nrow(metadata_missing) > 0) {
-    print(metadata_missing, row.names = FALSE)
-  }
-  
-  cat("\nMeasurement columns with missing data:", nrow(measurement_missing), "\n")
-  if(nrow(measurement_missing) > 0) {
-    cat("Top 10 measurement columns with highest missing percentages:\n")
-    print(head(measurement_missing, 10), row.names = FALSE)
-  }
-  
-} else {
-  cat("No missing data found in the dataset\n")
+# =========================
+# Missingness — 4 separate heat maps (one per site)
+# =========================
+# Prereqs assumed from your script:
+# - df_parsed (from your parsing block)
+# - build_site_grid(), rep_levels, plates_per_site, tile_border_width
+# - libraries: dplyr, ggplot2, tidyr, stringr (already in your code)
+
+# Pick exactly 4 sites (alphabetical); change this vector if you prefer specific ones
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) {
+  warning("Fewer than 4 sites found; plotting whatever is available.")
 }
+
+# build missing/observed status df for a site
+site_missing_df <- function(site_name) {
+  build_site_grid(site_name) %>%
+    dplyr::mutate(
+      data_status = dplyr::if_else(is_missing, "Missing", "Observed"),
+      data_status = factor(data_status, levels = c("Observed", "Missing"))
+    )
+}
+
+
+# ---- 1) Per-site numeric summary (for the 4 sites) ----
+missing_summary_4 <- lapply(sites_to_plot, site_missing_df) |>
+  dplyr::bind_rows() |>
+  dplyr::group_by(Metadata_Site) |>
+  dplyr::summarise(
+    total_wells    = dplyr::n(),
+    missing_wells  = sum(data_status == "Missing"),
+    observed_wells = sum(data_status == "Observed"),
+    missing_pct    = round(100 * mean(data_status == "Missing"), 2),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(missing_pct))
+
+cat("\n=== Missingness Summary (Selected 4 Sites) ===\n")
+print(missing_summary_4)
+
+
+
 ```
 
 *Insert analysis here*
@@ -106,53 +219,46 @@ if(nrow(cols_with_missing) > 0) {
 ## Missing Data Patterns
 
 ```{r missing-data-patterns}
-# Missing data patterns analysis
-cat("\n=== MISSING DATA PATTERNS ===\n")
 
-# Check for completely missing rows
-complete_rows <- complete.cases(df)
-missing_rows_count <- sum(!complete_rows)
-missing_rows_pct <- round(missing_rows_count / nrow(df) * 100, 2)
-
-cat("Rows with any missing data:", missing_rows_count, "(", missing_rows_pct, "%)\n")
-cat("Complete rows (no missing data):", sum(complete_rows), "\n")
-
-# Identify columns with high missing data (>50%)
-high_missing_cols <- missing_summary[missing_summary$Missing_Percentage > 50, ]
-if(nrow(high_missing_cols) > 0) {
-  cat("\nColumns with >50% missing data (candidates for removal):\n")
-  print(high_missing_cols, row.names = FALSE)
+# make the binary RAW-style missingness heat map for a site
+make_missing_plot <- function(site_name) {
+  sdf <- site_missing_df(site_name)
+  ggplot(sdf, aes(x = Col_Num, y = Row_Num)) +
+    geom_tile(aes(fill = data_status),
+              color = "grey30", linewidth = tile_border_width) +
+    facet_grid(RepFacet ~ PlateFacet, switch = "y", drop = FALSE) +  # 4 × 7 layout
+    scale_fill_manual(
+      values = c("Observed" = "white", "Missing" = "red"),
+      name   = "Data Status"
+    ) +
+    scale_x_continuous(breaks = seq(1, 24, 4), expand = c(0, 0)) +
+    scale_y_continuous(
+      breaks = seq(1, 16, 2),
+      labels = LETTERS[seq(1, 16, 2)],
+      trans  = "reverse", expand = c(0, 0)
+    ) +
+    labs(
+      title    = paste0("RAW Missingness — Site: ", site_name, " (4 Replicates × 7 Plates)"),
+      subtitle = "Red = Missing, White = Observed. Layout identical to RAW heat map.",
+      x = "Column", y = "Row"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) +
+    coord_fixed()
 }
+
+# ---- 2) Four separate heat maps (print one by one) ----
+plots_4 <- lapply(sites_to_plot, make_missing_plot)
+for (p in plots_4) print(p)
 ```
 
 *Insert analysis here*
 
-## Missing Data Correlations
 
-```{r missing-data-correlations}
-# Check for missing data correlation patterns
-if(sum(missing_counts) > 0) {
-  # Create missing indicator matrix
-  missing_matrix <- is.na(df)
-  
-  # Find columns that are always missing together
-  if(ncol(missing_matrix) > 1) {
-    missing_correlations <- cor(missing_matrix * 1, use = "pairwise.complete.obs")
-    perfect_missing_cor <- which(missing_correlations == 1 & row(missing_correlations) != col(missing_correlations), arr.ind = TRUE)
-    
-    if(length(perfect_missing_cor) > 0) {
-      cat("\nColumns with perfectly correlated missing patterns:\n")
-      for(i in 1:nrow(perfect_missing_cor)) {
-        col1 <- rownames(missing_correlations)[perfect_missing_cor[i,1]]
-        col2 <- colnames(missing_correlations)[perfect_missing_cor[i,2]]
-        cat(sprintf("  %s <-> %s\n", col1, col2))
-      }
-    }
-  }
-}
-```
-
-*Insert analysis here*
 
 ## Compound Cell Count Analysis
 
@@ -877,3 +983,95 @@ print(p_norm)
 ```
 
 *Insert analysis here*
+
+## Correlation of Cell Counts for well locations
+
+```{r}
+# =========================
+# Plate × Plate (7×7) correlations by wells — per site
+# Averaging 4 replicates first; Pearson r with pairwise complete wells
+# =========================
+
+# Sites to analyze (use all present; if you want just 4 specific sites, subset here)
+sites <- sort(unique(df_parsed$Metadata_Site))
+
+plots_corr <- list()
+
+for (site in sites) {
+  # 1) Pick exactly 7 plates for this site (same ordering logic you used)
+  p_order    <- plate_order_for_site(site)
+  sel_plates <- head(p_order, plates_per_site)
+  if (length(sel_plates) < plates_per_site) {
+    warning("Site ", site, " has only ", length(sel_plates),
+            " plate(s); correlation will reflect available plates.")
+  }
+
+  # 2) Average across replicates per (Plate, Row, Col)
+  avg_site <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site, Plate %in% sel_plates) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(avg_cell_count = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      # stable well id and NA cleanup (mean of all-NA -> NaN -> NA)
+      WellID = sprintf("%s%02d", Metadata_Row, Metadata_Col),
+      avg_cell_count = dplyr::na_if(avg_cell_count, NaN)
+    )
+
+  # 3) Make a wells × plates table (rows = wells, cols = plates in your chosen order)
+  mat_df <- avg_site %>%
+    dplyr::select(WellID, Plate, avg_cell_count) %>%
+    tidyr::pivot_wider(names_from = Plate, values_from = avg_cell_count) %>%
+    dplyr::select(tidyselect::any_of(sel_plates))  # enforce order; ignore placeholders
+
+  # Guard: need at least 2 plates to correlate
+  if (ncol(mat_df) < 2) {
+    message("Skipping site ", site, " (fewer than 2 plates after filtering).")
+    next
+  }
+
+  # 4) Correlation across plates (using the well vectors)
+  corr_mat <- stats::cor(mat_df, use = "pairwise.complete.obs", method = "pearson")
+
+  # 5) Pretty axis labels consistent with your plate facets
+  plate_labels <- sprintf("Plate %d\n%s", seq_along(colnames(corr_mat)), colnames(corr_mat))
+  colnames(corr_mat) <- plate_labels
+  rownames(corr_mat) <- plate_labels
+
+  # 6) Tidy + plot
+  corr_long <- as.data.frame(as.table(corr_mat)) %>%
+    dplyr::rename(Plate_X = Var1, Plate_Y = Var2, corr = Freq)
+
+  p <- ggplot(corr_long, aes(x = Plate_X, y = Plate_Y, fill = corr)) +
+    geom_tile(color = "grey20", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.2f", corr)), size = 3) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red",
+      midpoint = 0, limits = c(-1, 1), name = "Pearson r"
+    ) +
+    coord_equal() +
+    labs(
+      title = paste0("Plate × Plate Correlation by Wells — Site: ", site),
+      subtitle = "Well-wise cell counts averaged over 4 replicates; pairwise-complete Pearson correlations",
+      x = NULL, y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid  = element_blank(),
+      plot.title  = element_text(hjust = 0.5, face = "bold")
+    )
+
+  print(p)
+  plots_corr[[site]] <- p
+
+  # 7) Console summary (optional)
+  offdiag <- corr_mat[upper.tri(corr_mat) | lower.tri(corr_mat)]
+  cat("\nSite:", site,
+      "\n  Plates analyzed:", ncol(corr_mat),
+      "\n  Mean off-diagonal r:", round(mean(offdiag, na.rm = TRUE), 3),
+      "\n  Min r:", round(min(offdiag, na.rm = TRUE), 3),
+      "  Max r:", round(max(offdiag, na.rm = TRUE), 3), "\n")
+}
+
+```
