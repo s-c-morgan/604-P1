@@ -48,6 +48,8 @@ cat("Measurement columns:", length(measurement_cols), "\n")
   reps_per_site   <- 4
   rep_levels      <- paste0("R", 1:reps_per_site)
   
+  site_to_plot    <- "FMP" 
+  
   controls <- c("DMSO", "Nocodazole", "Tetrandrine")
   control_color_map <- c("DMSO"="green","Nocodazole"="purple","Tetrandrine"="red",
                          "Other"="grey80","Missing"="black")
@@ -1075,3 +1077,55 @@ for (site in sites) {
 }
 
 ```
+
+*Insert analysis here*
+
+## Box-Plot of Combounds All Sites 
+```{r Boxplots All Sites}
+#normalize across-sites
+
+df_compound_transform <- df %>% 
+  mutate(Metadata_Compound_type = if_else(Metadata_Compound_type == "EOS", Metadata_EOS, Metadata_Compound_type))
+
+df_norm <- df_compound_transform %>%
+  group_by(Metadata_Site) %>%
+  mutate(
+    z_value = (Metadata_Object_Count - mean(Metadata_Object_Count, na.rm = TRUE)) / sd(Metadata_Object_Count, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# find top 5 compounds by median
+top5_compounds <- df_norm %>%
+  group_by(Metadata_Compound_type) %>%
+  summarise(med_val = median(z_value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(med_val)) %>%
+  slice_head(n = 5) %>%
+  pull(Metadata_Compound_type)
+
+#filter data to those compounds and plot
+df_norm %>%
+  filter(Metadata_Compound_type %in% union(top5_compounds, c("Nocodazole", "Tetrandrine")) ) %>%
+  ggplot(aes(x = Metadata_Compound_type, y = z_value)) +
+  geom_boxplot() +
+  labs(title = "Top 5 Compounds by Median Value")
+
+
+# find top 5 compounds by median
+bottom5_compounds <- df_norm %>%
+  group_by(Metadata_Compound_type) %>%
+  summarise(med_val = median(z_value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(med_val) %>%
+  slice_head(n = 5) %>%
+  pull(Metadata_Compound_type)
+
+#filter data to those compounds and plot
+df_norm %>%
+  filter(Metadata_Compound_type %in% union(bottom5_compounds, c("DMSO")) ) %>%
+  ggplot(aes(x = Metadata_Compound_type, y = z_value)) +
+  geom_boxplot() +
+  labs(title = "Top 5 Compounds by Median Value")
+
+
+```
+
+*Insert analysis here*
