@@ -65,7 +65,6 @@ cat("Measurement columns:", length(measurement_cols), "\n")
   miss <- setdiff(req_cols, names(df))
   if (length(miss)) stop("Missing cols: ", paste(miss, collapse=", "))
   
-  # Pick your plate column (edit if needed)
   plate_col <- c("Metadata_Unique_plate","Metadata_Plate_num","Metadata_Plate",
                  "Plate","PlateID","Barcode","Metadata_Barcode")
   plate_col <- plate_col[plate_col %in% names(df)][1]
@@ -754,7 +753,6 @@ req_cols <- c("Metadata_Site","Metadata_Row","Metadata_Col",
 miss <- setdiff(req_cols, names(df))
 if (length(miss)) stop("Missing cols: ", paste(miss, collapse=", "))
 
-# Pick your plate column (edit if needed)
 plate_col <- c("Metadata_Unique_plate","Metadata_Plate_num","Metadata_Plate",
                "Plate","PlateID","Barcode","Metadata_Barcode")
 plate_col <- plate_col[plate_col %in% names(df)][1]
