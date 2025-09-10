@@ -1,0 +1,1711 @@
+---
+title: "Project-jason"
+output: html_document
+date: "2025-09-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Data Import and Setup
+
+```{r data-import}
+# EDA - Import RDS file as dataframe
+df <- readRDS("dat.rds")
+
+# Load required packages
+if (!require(dplyr)) install.packages("dplyr")
+library(dplyr)
+if (!require(ggplot2)) install.packages("ggplot2")
+library(ggplot2)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(stringr); library(ggplot2); library(forcats)
+})
+
+```
+
+## Initial Data Structure
+
+```{r data-structure}
+# Display initial structure
+cat("Original dataset dimensions:", dim(df), "\n")
+print(paste("Total columns:", ncol(df)))
+
+# Identify metadata columns vs measurement columns
+metadata_cols <- grep("^Metadata_", colnames(df), value = TRUE)
+measurement_cols <- setdiff(colnames(df), metadata_cols)
+
+cat("Metadata columns:", length(metadata_cols), "\n")
+cat("Measurement columns:", length(measurement_cols), "\n")
+```
+
+*Insert analysis here*
+
+## Recover the data structure
+
+```{r missing-data-analysis}
+  plates_per_site <- 7
+  reps_per_site   <- 4
+  rep_levels      <- paste0("R", 1:reps_per_site)
+  
+  site_to_plot    <- "FMP" 
+  
+  controls <- c("DMSO", "Nocodazole", "Tetrandrine")
+  control_color_map <- c("DMSO"="green","Nocodazole"="purple","Tetrandrine"="red",
+                         "Other"="grey80","Missing"="black")
+  missing_fill_color <- "grey30"
+  tile_border_width  <- 0.25
+  
+  # =========================
+  # Checks
+  # =========================
+  stopifnot(exists("df"))
+  req_cols <- c("Metadata_Site","Metadata_Row","Metadata_Col",
+                "Metadata_Object_Count","Metadata_Compound_type")
+  miss <- setdiff(req_cols, names(df))
+  if (length(miss)) stop("Missing cols: ", paste(miss, collapse=", "))
+  
+  plate_col <- c("Metadata_Unique_plate","Metadata_Plate_num","Metadata_Plate",
+                 "Plate","PlateID","Barcode","Metadata_Barcode")
+  plate_col <- plate_col[plate_col %in% names(df)][1]
+  if (is.na(plate_col)) stop("Set `plate_col` to your plate ID column.")
+  
+  # =========================
+  # Parse Plate & Replicate from plate string
+  # =========================
+  df_parsed <- df %>%
+    mutate(
+      Metadata_Row = as.character(Metadata_Row),
+      Metadata_Col = suppressWarnings(as.numeric(Metadata_Col)),
+      PlateRaw     = as.character(.data[[plate_col]]),
+      .rep_digit   = str_match(PlateRaw, "(?i)(?:^|[_-])R\\s*([1-4])$")[,2],
+      Replicate    = ifelse(!is.na(.rep_digit), paste0("R", str_trim(.rep_digit)), NA_character_),
+      Plate        = ifelse(!is.na(Replicate),
+                            str_replace(PlateRaw, "(?i)[_-]R\\s*[1-4]$", ""),
+                            PlateRaw)
+    ) %>%
+    select(-.rep_digit) %>%
+    filter(!is.na(Metadata_Col), Metadata_Col>=1, Metadata_Col<=24,
+           Metadata_Row %in% LETTERS[1:16])
+  
+  to_well_coords <- function(d) d %>% mutate(Row_Num = match(Metadata_Row, LETTERS[1:16]),
+                                             Col_Num = Metadata_Col)
+  
+  # Plate order helper (within THIS site)
+  plate_order_for_site <- function(site_name) {
+    p <- df_parsed %>% filter(Metadata_Site==site_name) %>% distinct(Plate) %>% pull(Plate)
+    if (!length(p)) return(character(0))
+    num <- suppressWarnings(as.numeric(str_extract(p, "\\d+")))
+    p[order(is.na(num), num, p)]
+  }
+  
+  # =========================
+  # Build complete **4 × 7** layout for ONE site
+  # =========================
+  build_site_grid <- function(site_name) {
+    wells <- expand_grid(Metadata_Row=LETTERS[1:16], Metadata_Col=1:24)
+    
+    # pick exactly 7 plates (pad with placeholders if fewer exist)
+    p_order <- plate_order_for_site(site_name)
+    sel_plates <- head(p_order, plates_per_site)
+    if (length(sel_plates) < plates_per_site) {
+      sel_plates <- c(sel_plates,
+                      paste0("MISSING_PLATE_", seq_len(plates_per_site - length(sel_plates))))
+    }
+    
+    # skeleton: 7 plates × 4 reps × wells
+    skel <- expand_grid(
+      Metadata_Site = site_name,
+      Plate         = sel_plates,
+      Replicate     = rep_levels
+    ) %>%
+      crossing(wells) %>%
+      to_well_coords() %>%
+      mutate(
+        PlateColIdx = match(Plate, sel_plates),          # columns = plates
+        RepRowIdx   = match(Replicate, rep_levels),      # rows    = replicates
+        PlateFacet  = factor(sprintf("Plate %d\n%s", PlateColIdx, Plate),
+                             levels = sprintf("Plate %d\n%s", 1:plates_per_site, sel_plates)),
+        RepFacet    = factor(sprintf("Rep %d\n%s", RepRowIdx, Replicate),
+                             levels = sprintf("Rep %d\n%s", 1:reps_per_site, rep_levels))
+      )
+    
+    # actual averages and dominant control (filtered to this site)
+    dat <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      summarise(avg_cell_count=mean(Metadata_Object_Count, na.rm=TRUE), .groups="drop")
+    
+    ctrl <- df_parsed %>%
+      filter(Metadata_Site==site_name) %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+      summarise(n=dplyr::n(), .groups="drop") %>%
+      group_by(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+      slice_max(order_by=n, n=1, with_ties=FALSE) %>%
+      ungroup() %>%
+      mutate(control_label = ifelse(Metadata_Compound_type %in% controls,
+                                    Metadata_Compound_type, "Other")) %>%
+      select(Metadata_Site, Plate, Replicate, Metadata_Row, Metadata_Col, control_label)
+    
+    merged <- skel %>%
+      left_join(dat,  by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col")) %>%
+      left_join(ctrl, by=c("Metadata_Site","Plate","Replicate","Metadata_Row","Metadata_Col"))
+    
+    if (!"control_label" %in% names(merged)) merged$control_label <- NA_character_
+    
+    merged %>%
+      mutate(
+        is_missing    = is.na(avg_cell_count),
+        control_label = ifelse(is_missing, "Missing", control_label)
+        # keep avg_cell_count = NA so fill uses `missing_fill_color`
+      )
+  }
+  
+  site_df <- build_site_grid(site_to_plot)
+  
+
+```
+
+*Insert analysis here*
+
+## Missing Data Count
+
+```{r missing-data-by-type}
+# =========================
+# Missingness — 4 separate heat maps (one per site)
+# =========================
+# Prereqs assumed from your script:
+# - df_parsed (from your parsing block)
+# - build_site_grid(), rep_levels, plates_per_site, tile_border_width
+# - libraries: dplyr, ggplot2, tidyr, stringr (already in your code)
+
+# Pick exactly 4 sites (alphabetical); change this vector if you prefer specific ones
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) {
+  warning("Fewer than 4 sites found; plotting whatever is available.")
+}
+
+# build missing/observed status df for a site
+site_missing_df <- function(site_name) {
+  build_site_grid(site_name) %>%
+    dplyr::mutate(
+      data_status = dplyr::if_else(is_missing, "Missing", "Observed"),
+      data_status = factor(data_status, levels = c("Observed", "Missing"))
+    )
+}
+
+
+# ---- 1) Per-site numeric summary (for the 4 sites) ----
+missing_summary_4 <- lapply(sites_to_plot, site_missing_df) |>
+  dplyr::bind_rows() |>
+  dplyr::group_by(Metadata_Site) |>
+  dplyr::summarise(
+    total_wells    = dplyr::n(),
+    missing_wells  = sum(data_status == "Missing"),
+    observed_wells = sum(data_status == "Observed"),
+    missing_pct    = round(100 * mean(data_status == "Missing"), 2),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(missing_pct))
+
+cat("\n=== Missingness Summary (Selected 4 Sites) ===\n")
+print(missing_summary_4)
+
+
+
+```
+
+*Insert analysis here*
+
+## Missing Data Patterns
+
+```{r missing-data-patterns}
+
+# make the binary RAW-style missingness heat map for a site
+make_missing_plot <- function(site_name) {
+  sdf <- site_missing_df(site_name)
+  ggplot(sdf, aes(x = Col_Num, y = Row_Num)) +
+    geom_tile(aes(fill = data_status),
+              color = "grey30", linewidth = tile_border_width) +
+    facet_grid(RepFacet ~ PlateFacet, switch = "y", drop = FALSE) +  # 4 × 7 layout
+    scale_fill_manual(
+      values = c("Observed" = "white", "Missing" = "red"),
+      name   = "Data Status"
+    ) +
+    scale_x_continuous(breaks = seq(1, 24, 4), expand = c(0, 0)) +
+    scale_y_continuous(
+      breaks = seq(1, 16, 2),
+      labels = LETTERS[seq(1, 16, 2)],
+      trans  = "reverse", expand = c(0, 0)
+    ) +
+    labs(
+      title    = paste0("RAW Missingness — Site: ", site_name, " (4 Replicates × 7 Plates)"),
+      subtitle = "Red = Missing, White = Observed. Layout identical to RAW heat map.",
+      x = "Column", y = "Row"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) +
+    coord_fixed()
+}
+
+# ---- 2) Four separate heat maps (print one by one) ----
+plots_4 <- lapply(sites_to_plot, make_missing_plot)
+for (p in plots_4) print(p)
+```
+
+*Insert analysis here*
+
+
+```{r well-position-setup}
+# CREATE WELL POSITION GRID ANALYSIS
+if("Metadata_Row" %in% colnames(df) && "Metadata_Col" %in% colnames(df)) {
+  cat("\nCreating well position grid analysis...\n")
+  
+  # Create unique well identifier
+  df_wells <- df %>%
+    mutate(Well_ID = paste0(Metadata_Row, sprintf("%02d", as.numeric(Metadata_Col)))) %>%
+    mutate(Well_Number = match(Well_ID, sort(unique(Well_ID))))
+  
+  # Calculate statistics per well
+  well_stats <- df_wells %>%
+    group_by(Metadata_Row, Metadata_Col, Well_ID, Well_Number) %>%
+    summarise(
+      avg_cell_count = mean(Metadata_Object_Count, na.rm = TRUE),
+      sd_cell_count = sd(Metadata_Object_Count, na.rm = TRUE),
+      observations = n(),
+      .groups = 'drop'
+    ) %>%
+    arrange(Well_Number)
+  
+  # Display well mapping
+  cat("\nFirst 20 well mappings:\n")
+  print(head(well_stats[c("Well_ID", "Well_Number", "avg_cell_count")], 20))
+  
+  # Create 16x24 grid (assuming standard 384-well plate: A-P rows, 1-24 columns)
+  # Convert row letters to numbers for plotting
+  well_stats <- well_stats %>%
+    mutate(
+      Row_Num = match(Metadata_Row, LETTERS[1:16]),
+      Col_Num = as.numeric(Metadata_Col)
+    )
+}
+```
+
+*Insert analysis here*
+
+
+## Correlation of Cell Counts for well locations
+
+```{r}
+# =========================
+# Plate × Plate (7×7) correlations by wells — per site
+# Averaging 4 replicates first; Pearson r with pairwise complete wells
+# =========================
+
+# Sites to analyze (use all present; if you want just 4 specific sites, subset here)
+sites <- sort(unique(df_parsed$Metadata_Site))
+
+plots_corr <- list()
+
+for (site in sites) {
+  # 1) Pick exactly 7 plates for this site (same ordering logic you used)
+  p_order    <- plate_order_for_site(site)
+  sel_plates <- head(p_order, plates_per_site)
+  if (length(sel_plates) < plates_per_site) {
+    warning("Site ", site, " has only ", length(sel_plates),
+            " plate(s); correlation will reflect available plates.")
+  }
+
+  # 2) Average across replicates per (Plate, Row, Col)
+  avg_site <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site, Plate %in% sel_plates) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(avg_cell_count = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      # stable well id and NA cleanup (mean of all-NA -> NaN -> NA)
+      WellID = sprintf("%s%02d", Metadata_Row, Metadata_Col),
+      avg_cell_count = dplyr::na_if(avg_cell_count, NaN)
+    )
+
+  # 3) Make a wells × plates table (rows = wells, cols = plates in your chosen order)
+  mat_df <- avg_site %>%
+    dplyr::select(WellID, Plate, avg_cell_count) %>%
+    tidyr::pivot_wider(names_from = Plate, values_from = avg_cell_count) %>%
+    dplyr::select(tidyselect::any_of(sel_plates))  # enforce order; ignore placeholders
+
+  # Guard: need at least 2 plates to correlate
+  if (ncol(mat_df) < 2) {
+    message("Skipping site ", site, " (fewer than 2 plates after filtering).")
+    next
+  }
+
+  # 4) Correlation across plates (using the well vectors)
+  corr_mat <- stats::cor(mat_df, use = "pairwise.complete.obs", method = "pearson")
+
+  # 5) Pretty axis labels consistent with your plate facets
+  plate_labels <- sprintf("Plate %d\n%s", seq_along(colnames(corr_mat)), colnames(corr_mat))
+  colnames(corr_mat) <- plate_labels
+  rownames(corr_mat) <- plate_labels
+
+  # 6) Tidy + plot
+  corr_long <- as.data.frame(as.table(corr_mat)) %>%
+    dplyr::rename(Plate_X = Var1, Plate_Y = Var2, corr = Freq)
+
+  p <- ggplot(corr_long, aes(x = Plate_X, y = Plate_Y, fill = corr)) +
+    geom_tile(color = "grey20", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.2f", corr)), size = 3) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red",
+      midpoint = 0, limits = c(-1, 1), name = "Pearson r"
+    ) +
+    coord_equal() +
+    labs(
+      title = paste0("Plate × Plate Correlation by Wells — Site: ", site),
+      subtitle = "Well-wise cell counts averaged over 4 replicates; pairwise-complete Pearson correlations",
+      x = NULL, y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid  = element_blank(),
+      plot.title  = element_text(hjust = 0.5, face = "bold")
+    )
+
+  print(p)
+  plots_corr[[site]] <- p
+
+  # 7) Console summary (optional)
+  offdiag <- corr_mat[upper.tri(corr_mat) | lower.tri(corr_mat)]
+  cat("\nSite:", site,
+      "\n  Plates analyzed:", ncol(corr_mat),
+      "\n  Mean off-diagonal r:", round(mean(offdiag, na.rm = TRUE), 3),
+      "\n  Min r:", round(min(offdiag, na.rm = TRUE), 3),
+      "  Max r:", round(max(offdiag, na.rm = TRUE), 3), "\n")
+}
+
+```
+
+*Insert analysis here*
+
+## Correlation for replicates
+```{r}
+# ============================================================
+# Replicate × Replicate (4×4) correlations — 4 subplots (one per site)
+# Well-wise comparison across all wells (plates × rows × cols)
+# ============================================================
+
+# Choose 4 sites to show (edit as needed)
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) {
+  warning("Fewer than 4 sites available; will plot what exists.")
+}
+
+# Helper: compute replicate correlation matrix (well-wise) for a site
+replicate_corr_for_site <- function(site_name) {
+  # Pick up to 7 plates for consistency with your layout/order logic
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  # Aggregate to one value per (Replicate, Plate, Row, Col)
+  per_rep <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Replicate, Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      # key for aligning wells across replicates
+      WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)
+    )
+
+  # Wide: rows = wells, cols = replicates (R1..R4), entries = cell count
+  mat_df <- per_rep %>%
+    dplyr::select(WellKey, Replicate, value) %>%
+    tidyr::pivot_wider(names_from = Replicate, values_from = value) %>%
+    dplyr::select(tidyselect::any_of(rep_levels))  # keep order R1..R4 if present
+
+  # Need at least 2 replicates with data to compute correlations
+  if (ncol(mat_df) < 2) return(NULL)
+
+  corr <- stats::cor(as.data.frame(mat_df),
+                     use = "pairwise.complete.obs", method = "pearson")
+
+  # Tidy for plotting
+  as.data.frame(as.table(corr)) %>%
+    dplyr::rename(Rep_X = Var1, Rep_Y = Var2, corr = Freq) %>%
+    dplyr::mutate(Metadata_Site = site_name)
+}
+
+# Compute per-site replicate correlations and combine
+corr_long_list <- lapply(sites_to_plot, replicate_corr_for_site)
+corr_long <- dplyr::bind_rows(corr_long_list)
+
+# If nothing to plot, bail gracefully
+if (nrow(corr_long) == 0) {
+  stop("No replicate correlation data found for the selected sites.")
+}
+
+# ---- Plot: 4 subplots (one per site) ----
+p_rep_corr <- ggplot(corr_long, aes(x = Rep_X, y = Rep_Y, fill = corr)) +
+  geom_tile(color = "grey20", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", corr)), size = 3) +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, limits = c(-1, 1), name = "Pearson r"
+  ) +
+  coord_equal() +
+  facet_wrap(~ Metadata_Site, ncol = 2) +
+  labs(
+    title = "Replicate × Replicate Correlation (well-wise)",
+    subtitle = "Each panel is a site. Correlations computed across all wells after collapsing duplicates per well within each replicate.",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank(),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_rep_corr)
+
+# ---- Optional: numeric summary per site (off-diagonal r) ----
+rep_summary <- corr_long %>%
+  dplyr::filter(Rep_X != Rep_Y) %>%
+  dplyr::group_by(Metadata_Site) %>%
+  dplyr::summarise(
+    mean_offdiag = round(mean(corr, na.rm = TRUE), 3),
+    min_offdiag  = round(min(corr, na.rm = TRUE), 3),
+    max_offdiag  = round(max(corr, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+cat("\n=== Replicate Correlation Summary (off-diagonal) ===\n")
+print(rep_summary)
+
+```
+
+
+## More analysis on this
+
+```{r}
+# ============================================================
+# Replicate-focused diagnostics for systematic errors
+#   A) Residual spatial maps (rep − consensus)
+#   B) RMSE heat map (4×7)
+#   C) Row/Column trends per replicate
+#   D) Per-plate pairwise-r heat map (6 pairs × 7 plates)
+# ============================================================
+
+# ---- helpers ----
+.well_prep_site <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  wells <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels,
+                  !is.na(Metadata_Row),
+                  !is.na(Metadata_Col)) %>%
+    dplyr::group_by(Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      Row_Num = match(Metadata_Row, LETTERS[1:16]),
+      Col_Num = as.numeric(Metadata_Col),
+      PlateColIdx = match(Plate, sel_plates),
+      RepRowIdx   = match(Replicate, rep_levels),
+      PlateFacet  = factor(sprintf("Plate %d\n%s", PlateColIdx, Plate),
+                           levels = sprintf("Plate %d\n%s", 1:length(sel_plates), sel_plates)),
+      RepFacet    = factor(sprintf("Rep %d\n%s", RepRowIdx, Replicate),
+                           levels = sprintf("Rep %d\n%s", 1:length(rep_levels), rep_levels)),
+      WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)
+    )
+
+  # across-replicate consensus per well (same plate,row,col)
+  consensus <- wells %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(cons = mean(value, na.rm = TRUE), .groups="drop")
+
+  wells <- wells %>%
+    dplyr::left_join(consensus,
+                     by = c("Plate","Metadata_Row","Metadata_Col")) %>%
+    dplyr::mutate(resid = value - cons)
+
+  list(wells = wells, sel_plates = sel_plates)
+}
+
+# ---------- A) residual spatial maps (like your RAW layout) ----------
+plot_residual_maps <- function(site_name) {
+  prep  <- .well_prep_site(site_name); wells <- prep$wells
+
+  ggplot(wells, aes(x = Col_Num, y = Row_Num, fill = resid)) +
+    geom_tile(color = "white", linewidth = tile_border_width) +
+    facet_grid(RepFacet ~ PlateFacet, switch = "y", drop = FALSE) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = 0, name = "Residual\n(rep − mean)") +
+    scale_x_continuous(breaks = seq(1,24,4), expand = c(0,0)) +
+    scale_y_continuous(breaks = seq(1,16,2), labels = LETTERS[seq(1,16,2)],
+                       trans = "reverse", expand = c(0,0)) +
+    coord_fixed() +
+    labs(title = paste0("Residual Spatial Maps — Site: ", site_name),
+         subtitle = "Per-well residuals (replicate − across-replicate mean) reveal spatial/batch patterns",
+         x="Column", y="Row") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title=element_text(hjust=0.5, face="bold"),
+          panel.grid=element_blank(),
+          strip.text=element_text(face="bold"))
+}
+
+# ---------- B) RMSE heat map (4×7) ----------
+plot_rmse_panel <- function(site_name) {
+  prep  <- .well_prep_site(site_name); wells <- prep$wells
+
+  rmse_df <- wells %>%
+    dplyr::group_by(Plate, Replicate, PlateColIdx, RepRowIdx) %>%
+    dplyr::summarise(RMSE = sqrt(mean(resid^2, na.rm = TRUE)), .groups = "drop")
+
+  grid <- tidyr::expand_grid(
+    PlateColIdx = sort(unique(wells$PlateColIdx)),
+    RepRowIdx   = sort(unique(wells$RepRowIdx))
+  ) %>%
+    dplyr::mutate(
+      Plate    = unique(wells$Plate)[match(PlateColIdx, unique(wells$PlateColIdx))],
+      Replicate= rep_levels[RepRowIdx]
+    ) %>%
+    dplyr::left_join(rmse_df, by = c("Plate","Replicate","PlateColIdx","RepRowIdx"))
+
+  ggplot(grid, aes(x = PlateColIdx, y = RepRowIdx, fill = RMSE)) +
+    geom_tile(color = "grey30", linewidth = tile_border_width) +
+    scale_fill_gradient(low = "white", high = "red", na.value = "grey90",
+                        name = "RMSE\n(residual)") +
+    scale_x_continuous(breaks = grid$PlateColIdx %>% unique(),
+                       labels = sprintf("Plate %d\n%s",
+                                        grid$PlateColIdx %>% unique(),
+                                        grid$Plate    %>% unique()),
+                       expand = c(0,0)) +
+    scale_y_continuous(breaks = seq_along(rep_levels), labels = rep_levels,
+                       trans = "reverse", expand = c(0,0)) +
+    coord_fixed() +
+    labs(title = paste0("Deviation from Consensus (RMSE) — Site: ", site_name),
+         subtitle = "Higher RMSE = replicate diverges from across-replicate mean across wells",
+         x=NULL, y="Replicate") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+# ---------- C) Row/Column trends per replicate ----------
+plot_row_col_trends <- function(site_name) {
+  prep  <- .well_prep_site(site_name); wells <- prep$wells
+
+  row_tr <- wells %>%
+    dplyr::group_by(Replicate, Row_Num) %>%
+    dplyr::summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+  col_tr <- wells %>%
+    dplyr::group_by(Replicate, Col_Num) %>%
+    dplyr::summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+  p_row <- ggplot(row_tr, aes(x = Row_Num, y = mean_val, group = Replicate)) +
+    geom_line(aes(linetype = Replicate)) + geom_point() +
+    scale_x_continuous(breaks = 1:16, labels = LETTERS[1:16]) +
+    labs(title = paste0("Row Trend — Site: ", site_name),
+         x = "Row", y = "Mean cell count") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  p_col <- ggplot(col_tr, aes(x = Col_Num, y = mean_val, group = Replicate)) +
+    geom_line(aes(linetype = Replicate)) + geom_point() +
+    scale_x_continuous(breaks = seq(1,24,2)) +
+    labs(title = paste0("Column Trend — Site: ", site_name),
+         x = "Column", y = "Mean cell count") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+  list(row = p_row, col = p_col)
+}
+
+# ---------- D) Per-plate pairwise-r heat map (6 pairs × 7 plates) ----------
+plot_pairwise_r_by_plate <- function(site_name) {
+  prep  <- .well_prep_site(site_name); wells <- prep$wells
+
+  # well matrix per plate: rows=wells, cols=replicates, correlate columns
+  calc_r_for_plate <- function(df_plate) {
+    wide <- df_plate %>%
+      dplyr::select(WellKey, Replicate, value) %>%
+      tidyr::pivot_wider(names_from = Replicate, values_from = value) %>%
+      dplyr::select(tidyselect::any_of(rep_levels))
+    if (ncol(wide) < 2) return(NULL)
+    cm <- stats::cor(as.data.frame(wide), use="pairwise.complete.obs", method="pearson")
+    # extract upper triangle pairs
+    pairs <- combn(colnames(cm), 2, simplify = FALSE)
+    out <- dplyr::bind_rows(lapply(pairs, function(pr) {
+      data.frame(pair = paste(pr, collapse="–"), r = cm[pr[1], pr[2]])
+    }))
+    out
+  }
+
+  r_by_plate <- wells %>%
+    dplyr::group_by(Plate) %>%
+    dplyr::group_modify(~ calc_r_for_plate(.x)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(PlateColIdx = match(Plate, unique(wells$Plate)),
+                  pair = factor(pair,
+                                levels = c("R1–R2","R1–R3","R1–R4",
+                                           "R2–R3","R2–R4","R3–R4")))
+
+  ggplot(r_by_plate, aes(x = PlateColIdx, y = pair, fill = r)) +
+    geom_tile(color = "grey30", linewidth = 0.25) +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+    scale_fill_gradient2(low="blue", mid="white", high="red",
+                         limits=c(-1,1), midpoint=0, name="Pearson r") +
+    scale_x_continuous(breaks = r_by_plate$PlateColIdx,
+                       labels = sprintf("Plate %d",
+                                        r_by_plate$PlateColIdx
+                                        ),
+                       expand = c(0,0)) +
+    labs(title = paste0("Pairwise Replicate r by Plate — Site: ", site_name),
+         x = NULL, y = "Replicate pair") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+# =========================
+# Run for your four sites
+# =========================
+sites_to_check <- sort(unique(df_parsed$Metadata_Site))[1:4]
+
+for (st in sites_to_check) {
+  print(plot_residual_maps(st))      # A
+  print(plot_rmse_panel(st))         # B
+  tr <- plot_row_col_trends(st)      # C
+  print(tr$row); print(tr$col)
+  print(plot_pairwise_r_by_plate(st))# D
+}
+
+
+```
+
+## Swap Plate 1 and 7 in Site IMTM
+```{r}
+# =========================
+# 1) Helper: plate order from a given data frame
+# =========================
+plate_order_for_site_df <- function(d, site_name) {
+  p <- d %>% dplyr::filter(Metadata_Site == site_name) %>%
+    dplyr::distinct(Plate) %>% dplyr::pull(Plate)
+  if (!length(p)) return(character(0))
+  num <- suppressWarnings(stringr::str_extract(p, "\\d+") %>% as.numeric())
+  p[order(is.na(num), num, p)]
+}
+
+# =========================
+# 2) Swap Plate 1 <-> Plate 7 in R4 for a site (non-destructive)
+# =========================
+swap_R4_plate1_7 <- function(d, site_name) {
+  sel <- head(plate_order_for_site_df(d, site_name), plates_per_site)
+  stopifnot(length(sel) >= 7)            # ensure 7 plates exist
+  p1 <- sel[1]; p7 <- sel[7]
+
+  d %>%
+    dplyr::mutate(
+      Plate = dplyr::case_when(
+        Metadata_Site == site_name & Replicate == "R4" & Plate == p1 ~ p7,
+        Metadata_Site == site_name & Replicate == "R4" & Plate == p7 ~ p1,
+        TRUE ~ Plate
+      )
+    )
+}
+
+# =========================
+# 3) Analysis: pairwise replicate r by plate (well-wise)
+# =========================
+pairwise_r_by_plate_plot <- function(d, site_name, tile_border_width = 0.25) {
+  sel <- head(plate_order_for_site_df(d, site_name), plates_per_site)
+
+  # well-wise table
+  wells <- d %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Replicate) %>%
+    dplyr::summarise(v = mean(Metadata_Object_Count, na.rm = TRUE), .groups="drop")
+
+  # per-plate replicate correlations
+  calc_r_for_plate <- function(df_plate) {
+    wide <- df_plate %>%
+      tidyr::pivot_wider(names_from = Replicate, values_from = v) %>%
+      dplyr::select(tidyselect::any_of(rep_levels))
+    if (ncol(wide) < 2) return(NULL)
+    cm <- stats::cor(as.data.frame(wide), use = "pairwise.complete.obs")
+    pairs <- combn(colnames(cm), 2, simplify = FALSE)
+    dplyr::bind_rows(lapply(pairs, function(pr) {
+      data.frame(pair = paste(pr, collapse = "–"), r = cm[pr[1], pr[2]])
+    }))
+  }
+
+  r_by_plate <- wells %>%
+    dplyr::group_by(Plate) %>%
+    dplyr::group_modify(~ calc_r_for_plate(.x)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      Plate = factor(Plate, levels = sel),
+      PlateColIdx = as.integer(Plate),
+      pair = factor(pair,
+                    levels = c("R1–R2","R1–R3","R1–R4",
+                               "R2–R3","R2–R4","R3–R4"))
+    )
+
+  ggplot(r_by_plate, aes(x = PlateColIdx, y = pair, fill = r)) +
+    geom_tile(color = "grey30", linewidth = tile_border_width) +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         limits = c(-1,1), midpoint = 0, name = "Pearson r") +
+    scale_x_continuous(
+      breaks = seq_along(sel),
+      labels = sprintf("Plate%d", seq_along(sel)),
+      expand = c(0,0)
+      
+    ) +
+    labs(title = paste0("Pairwise Replicate r by Plate — Site: ", site_name),
+         x = NULL, y = "Replicate pair") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+# =========================
+# 4) Do the swap for a site and re-plot (before/after)
+# =========================
+site_swap <- "IMTM"   # <-- change if needed
+
+# Before
+p_before <- pairwise_r_by_plate_plot(df_parsed, site_swap)
+print(p_before)
+
+# Swap
+df_parsed_swapped <- swap_R4_plate1_7(df_parsed, site_swap)
+
+# After
+p_after  <- pairwise_r_by_plate_plot(df_parsed_swapped, site_swap)
+print(p_after)
+```
+```{r}
+# ==========================================
+# Line plots for Row A in Plate 1 and Plate 7 (this site)
+# ==========================================
+
+site_name <- "IMTM"  # <-- change if needed
+
+# Use swapped data if available
+d <- if (exists("df_parsed_swapped")) df_parsed_swapped else df_parsed
+
+# Helper: plate order for a given data frame (keeps your numeric-aware ordering)
+plate_order_for_site_df <- function(d, site_name) {
+  p <- d %>% dplyr::filter(Metadata_Site == site_name) %>%
+    dplyr::distinct(Plate) %>% dplyr::pull(Plate)
+  if (!length(p)) return(character(0))
+  num <- suppressWarnings(stringr::str_extract(p, "\\d+") %>% as.numeric())
+  p[order(is.na(num), num, p)]
+}
+
+# Pick plate IDs corresponding to "Plate 1" and "Plate 7" for this site
+sel <- head(plate_order_for_site_df(d, site_name), plates_per_site)
+stopifnot(length(sel) >= 7)
+plate1 <- sel[1]; plate7 <- sel[7]
+
+# Build tidy data for the first row (Row A) of a given plate
+first_row_df <- function(d, site_name, plate_id) {
+  d %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate == plate_id,
+                  Replicate %in% rep_levels) %>%
+    dplyr::mutate(
+      Metadata_Row = as.character(Metadata_Row),
+      Metadata_Col = suppressWarnings(as.numeric(Metadata_Col))
+    ) %>%
+    dplyr::filter(Metadata_Row == "A", !is.na(Metadata_Col)) %>%
+    dplyr::group_by(Replicate, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(Replicate = factor(Replicate, levels = rep_levels))
+}
+
+df_p1 <- first_row_df(df_parsed, site_name, plate1)
+df_p7 <- first_row_df(df_parsed, site_name, plate7)
+
+# Plot function
+plot_rowA <- function(df_row, plate_label) {
+  ggplot(df_row, aes(x = Metadata_Col, y = value, color = Replicate, group = Replicate)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    scale_x_continuous(breaks = seq(1, 24, 2), limits = c(1, 10)) +
+    labs(
+      title = paste0("Site: ", site_name, " — Plate ", plate_label, " — Row A"),
+      x = "Column (1–10)",
+      y = "Cell count (Row A)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+p_rowA_p1 <- plot_rowA(df_p1, paste0("1 (", plate1, ")"))
+p_rowA_p7 <- plot_rowA(df_p7, paste0("7 (", plate7, ")"))
+
+print(p_rowA_p1)
+print(p_rowA_p7)
+
+
+```
+
+
+
+```{r}
+# ==========================================
+# DMSO boxplots by plate — 4 sites × 4 replicates
+# ==========================================
+
+d <- if (exists("df_parsed_swapped")) df_parsed_swapped else df_parsed
+sites_to_plot <- intersect(c("FMP","IMTM","MEDINA","USC"),
+                           sort(unique(d$Metadata_Site)))[1:4]
+
+# helper: numeric-aware plate order for this data frame
+plate_order_for_site_df <- function(dd, site) {
+  p <- dd %>% dplyr::filter(Metadata_Site == site) %>% dplyr::distinct(Plate) %>% dplyr::pull(Plate)
+  if (!length(p)) return(character(0))
+  num <- suppressWarnings(stringr::str_extract(p, "\\d+") %>% as.numeric())
+  p[order(is.na(num), num, p)]
+}
+
+# helper: DMSO well keys per site using dominant label per well
+dmso_well_keys <- function(dd, site) {
+  sel <- head(plate_order_for_site_df(dd, site), plates_per_site)
+  dd %>%
+    dplyr::filter(Metadata_Site == site, Plate %in% sel) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(Metadata_Compound_type == "DMSO") %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, as.integer(Metadata_Col))) %>%
+    dplyr::select(Plate, WellKey)
+}
+# --- unchanged helpers above (plate_order_for_site_df, dmso_well_keys, dmso_site_long) ---
+# Just add PlateIdx inside dmso_site_long and use it in the plot.
+
+dmso_site_long <- function(dd, site) {
+  sel  <- head(plate_order_for_site_df(dd, site), plates_per_site)
+  keys <- dmso_well_keys(dd, site)
+
+  dd %>%
+    dplyr::filter(Metadata_Site == site,
+                  Plate %in% sel,
+                  Replicate %in% rep_levels) %>%
+    dplyr::mutate(Metadata_Row = as.character(Metadata_Row),
+                  Metadata_Col = as.integer(Metadata_Col)) %>%
+    dplyr::group_by(Replicate, Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::inner_join(keys, by = c("Plate","WellKey")) %>%
+    dplyr::mutate(
+      Plate      = factor(Plate, levels = sel),
+      PlateIdx   = match(Plate, sel),                # <-- plate number 1..7
+      Replicate  = factor(Replicate, levels = rep_levels)
+    )
+}
+
+plot_dmso_box_site <- function(dd, site) {
+  df <- dmso_site_long(dd, site)
+
+  ggplot(df, aes(x = factor(PlateIdx, levels = 1:plates_per_site), y = value)) +
+    geom_boxplot(outlier.alpha = 0.5, fill = "grey92", color = "grey35") +
+    geom_jitter(width = 0.15, alpha = 0.25, size = 0.6) +
+    facet_wrap(~ Replicate, ncol = 2) +
+    scale_x_discrete(drop = FALSE, labels = as.character(1:plates_per_site)) +  # <-- numbers
+    labs(
+      title = paste0("DMSO control — Boxplots by Plate (Site: ", site, ")"),
+      subtitle = "x-axis shows plate number (1–7); one panel per replicate",
+      x = "Plate #", y = "Cell count"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+# produce the four figures (one per site)
+d <- if (exists("df_parsed_swapped")) df_parsed_swapped else df_parsed
+sites_to_plot <- intersect(c("FMP","IMTM","MEDINA","USC"),
+                           sort(unique(d$Metadata_Site)))[1:4]
+for (st in sites_to_plot) print(plot_dmso_box_site(d, st))
+
+```
+```{r}
+# ==========================================
+# Location-effect boxplots (NON-CONTROLS ONLY)
+# 4 figures (one per site), each has 4 subplots (R1–R4)
+# Boxplots are by column (1–24), pooled across plates,
+# using robust z within Plate×Replicate to remove plate offsets.
+# ==========================================
+
+d <- if (exists("df_parsed_swapped")) df_parsed_swapped else df_parsed
+sites_to_plot <- intersect(c("FMP","IMTM","MEDINA","USC"),
+                           sort(unique(d$Metadata_Site)))[1:4]
+
+# --- helper: numeric-aware plate order for a given data frame
+plate_order_for_site_df <- function(dd, site) {
+  p <- dd %>% dplyr::filter(Metadata_Site == site) %>% dplyr::distinct(Plate) %>% dplyr::pull(Plate)
+  if (!length(p)) return(character(0))
+  num <- suppressWarnings(stringr::str_extract(p, "\\d+") %>% as.numeric())
+  p[order(is.na(num), num, p)]
+}
+
+# --- helper: keep wells whose dominant label is NOT a control
+noncontrol_well_keys_for_site <- function(dd, site) {
+  sel <- head(plate_order_for_site_df(dd, site), plates_per_site)
+  dd %>%
+    dplyr::filter(Metadata_Site == site, Plate %in% sel) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!(Metadata_Compound_type %in% controls)) %>%   # exclude controls
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, as.integer(Metadata_Col))) %>%
+    dplyr::select(Plate, WellKey)
+}
+
+# --- build tidy NON-CONTROL well data for a site
+build_location_df <- function(dd, site) {
+  sel  <- head(plate_order_for_site_df(dd, site), plates_per_site)
+  keys <- noncontrol_well_keys_for_site(dd, site)
+
+  df <- dd %>%
+    dplyr::filter(Metadata_Site == site,
+                  Plate %in% sel,
+                  Replicate %in% rep_levels) %>%
+    dplyr::mutate(Metadata_Row = as.character(Metadata_Row),
+                  Metadata_Col = as.integer(Metadata_Col)) %>%
+    dplyr::group_by(Replicate, Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::inner_join(keys, by = c("Plate","WellKey")) %>%      # keep NON-controls
+    dplyr::mutate(
+      Plate     = factor(Plate, levels = sel),
+      Replicate = factor(Replicate, levels = rep_levels),
+      Col_Num   = Metadata_Col,
+      Row_Ltr   = Metadata_Row
+    )
+
+  # Robust within-plate×replicate normalization to isolate location effects
+  df %>%
+    dplyr::group_by(Plate, Replicate) %>%
+    dplyr::mutate(
+      med = stats::median(value, na.rm = TRUE),
+      mad = stats::mad(value, center = med, constant = 1.4826, na.rm = TRUE),
+      value_norm = dplyr::if_else(is.finite(mad) & mad > 0, (value - med)/mad, value - med)
+    ) %>%
+    dplyr::ungroup()
+}
+
+# --- plot: by COLUMN (1–24) with facets for R1–R4
+plot_location_box_by_col <- function(df_loc, site) {
+  ggplot(df_loc, aes(x = factor(Col_Num, levels = 1:24), y = value_norm)) +
+    geom_boxplot(outlier.alpha = 0.35, fill = "grey92", color = "grey35") +
+    geom_jitter(width = 0.15, alpha = 0.15, size = 0.5) +
+    facet_wrap(~ Replicate, ncol = 2) +
+    scale_x_discrete(drop = FALSE) +
+    labs(
+      title = paste0("Location Effect (Columns) — Non-controls — Site: ", site),
+      subtitle = "Robust z within Plate×Replicate; higher spread/shift at specific columns suggests location bias",
+      x = "Column (1–24)",
+      y = "Robust z (within Plate×Replicate)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+# ---- produce the four figures (one per site)
+for (st in sites_to_plot) {
+  df_loc <- build_location_df(d, st)
+  print(plot_location_box_by_col(df_loc, st))
+}
+```
+
+```{r}
+# ============================================================
+# RECONCILING "CONTRADICTION": remove plate effects & summarize r
+#   A) Pooled replicate r (raw vs plate-centered)
+#   B) Fisher-z averaged r across plates
+#   C) Replicate × Plate mean heat map
+# ============================================================
+
+# --- helper: per-site well table (one value per replicate × plate × well) ---
+.well_table_site <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels,
+                  !is.na(Metadata_Row), !is.na(Metadata_Col)) %>%
+    dplyr::group_by(Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col),
+      Plate   = factor(Plate, levels = sel_plates)
+    )
+}
+
+# --- standardize within plate (none | demean | z) ---
+.standardize <- function(df, mode = c("none","demean","z")) {
+  mode <- match.arg(mode)
+  if (mode == "none") return(df %>% dplyr::mutate(value_std = value))
+  if (mode == "demean") {
+    return(df %>%
+      dplyr::group_by(Plate) %>%
+      dplyr::mutate(value_std = value - mean(value, na.rm = TRUE)) %>%
+      dplyr::ungroup())
+  }
+  # z-score within plate
+  df %>%
+    dplyr::group_by(Plate) %>%
+    dplyr::mutate(
+      mu = mean(value, na.rm = TRUE),
+      sd = stats::sd(value, na.rm = TRUE),
+      value_std = ifelse(is.finite(sd) & sd > 0, (value - mu)/sd, value - mu)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-mu, -sd)
+}
+
+# --- compute pooled replicate correlation across all plates/wells ---
+.pooled_rep_corr <- function(df_std) {
+  wide <- df_std %>%
+    dplyr::select(WellKey, Replicate, value_std) %>%
+    tidyr::pivot_wider(names_from = Replicate, values_from = value_std) %>%
+    dplyr::select(tidyselect::any_of(rep_levels))
+  stats::cor(as.data.frame(wide), use = "pairwise.complete.obs", method = "pearson")
+}
+
+.plot_corr_heat <- function(C, title, subtitle) {
+  lab <- data.frame(as.table(C)) |>
+    dplyr::rename(Rep_X=Var1, Rep_Y=Var2, r=Freq)
+  ggplot(lab, aes(Rep_X, Rep_Y, fill = r)) +
+    geom_tile(color="grey20", linewidth=0.3) +
+    geom_text(aes(label=sprintf("%.2f", r)), size=3) +
+    scale_fill_gradient2(low="blue", mid="white", high="red",
+                         limits=c(-1,1), midpoint=0, name="Pearson r") +
+    coord_equal() +
+    labs(title=title, subtitle=subtitle, x=NULL, y=NULL) +
+    theme_minimal(base_size=12) +
+    theme(plot.title=element_text(hjust=0.5, face="bold"),
+          panel.grid=element_blank(),
+          axis.text.x=element_text(angle=45, hjust=1))
+}
+
+# --- Fisher-z averaged correlation across plates ---
+.fisher_z_avg <- function(site_name) {
+  df <- .well_table_site(site_name)
+  per_plate <- df %>%
+    dplyr::group_by(Plate) %>%
+    dplyr::group_modify(~{
+      wide <- .x %>%
+        dplyr::select(WellKey, Replicate, value) %>%
+        tidyr::pivot_wider(names_from=Replicate, values_from=value) %>%
+        dplyr::select(tidyselect::any_of(rep_levels))
+      if (ncol(wide) < 2) return(tibble::tibble())
+      C <- stats::cor(as.data.frame(wide), use="pairwise.complete.obs")
+      # stack upper triangle (incl diag) with weights
+      out <- as.data.frame(as.table(C))
+      colnames(out) <- c("Rep_X","Rep_Y","r")
+      out$w <- nrow(wide) - 3  # approx weight for Fisher z
+      out
+    }) %>% dplyr::ungroup()
+
+  # Fisher z combine per (pair)
+  Z <- per_plate %>%
+    dplyr::mutate(z = atanh(pmax(pmin(r,  0.9999), -0.9999))) %>%
+    dplyr::group_by(Rep_X, Rep_Y) %>%
+    dplyr::summarise(z_bar = weighted.mean(z, w, na.rm=TRUE), .groups="drop") %>%
+    dplyr::mutate(r_meta = tanh(z_bar))
+
+  # to matrix
+  reps <- rep_levels[rep_levels %in% unique(c(Z$Rep_X, Z$Rep_Y))]
+  M <- matrix(NA_real_, nrow=length(reps), ncol=length(reps),
+              dimnames=list(reps, reps))
+  for (i in seq_len(nrow(Z))) M[Z$Rep_X[i], Z$Rep_Y[i]] <- Z$r_meta[i]
+  # symmetrize + diag=1
+  M[lower.tri(M)] <- t(M)[lower.tri(M)]
+  diag(M) <- 1
+  M
+}
+
+# --- replicate × plate mean heat map (4×7) ---
+.plot_panel_means <- function(site_name) {
+  df <- .well_table_site(site_name)
+  means <- df %>%
+    dplyr::group_by(Plate, Replicate) %>%
+    dplyr::summarise(mean_val = mean(value, na.rm=TRUE), .groups="drop") %>%
+    dplyr::mutate(
+      PlateColIdx = as.integer(Plate),
+      RepRowIdx   = match(Replicate, rep_levels)
+    )
+
+  ggplot(means, aes(x=PlateColIdx, y=RepRowIdx, fill=mean_val)) +
+    geom_tile(color="grey30", linewidth=tile_border_width) +
+    geom_text(aes(label=sprintf("%.0f", mean_val)), size=3) +
+    scale_fill_gradient(low="white", high="red", name="Mean\ncell count") +
+    scale_x_continuous(
+      breaks = means$PlateColIdx %>% unique(),
+      labels = sprintf("Plate %d\n%s",
+                       means$PlateColIdx %>% unique(),
+                       levels(means$Plate)[means$PlateColIdx %>% unique()]),
+      expand = c(0,0)
+    ) +
+    scale_y_continuous(breaks=seq_along(rep_levels), labels=rep_levels,
+                       trans="reverse", expand=c(0,0)) +
+    coord_fixed() +
+    labs(title=paste0("Replicate × Plate mean — Site: ", site_name),
+         subtitle="Large row/column structure indicates plate/replicate offsets",
+         x=NULL, y="Replicate") +
+    theme_minimal(base_size=12) +
+    theme(panel.grid=element_blank(),
+          plot.title=element_text(hjust=0.5, face="bold"))
+}
+
+# =========================
+# Run for sites of interest
+# =========================
+sites_to_check <- sort(unique(df_parsed$Metadata_Site))[1:4]
+
+for (st in sites_to_check) {
+  df_site <- .well_table_site(st)
+
+  # A) Pooled r (raw vs plate-centered)
+  C_raw   <- .pooled_rep_corr(.standardize(df_site, "none"))
+  C_demean<- .pooled_rep_corr(.standardize(df_site, "demean"))
+  C_z     <- .pooled_rep_corr(.standardize(df_site, "z"))
+
+  print(.plot_corr_heat(C_raw,
+        paste0("Pooled replicate r (RAW) — Site: ", st),
+        "Across all plates/wells"))
+  print(.plot_corr_heat(C_demean,
+        paste0("Pooled replicate r (Plate-demeaned) — Site: ", st),
+        "Within-plate means removed"))
+  print(.plot_corr_heat(C_z,
+        paste0("Pooled replicate r (Plate z-scored) — Site: ", st),
+        "Within-plate mean+scale removed"))
+
+  # B) Fisher-z averaged r across plates
+  C_meta <- .fisher_z_avg(st)
+  print(.plot_corr_heat(C_meta,
+        paste0("Meta (Fisher-z) replicate r — Site: ", st),
+        "Plate-wise r combined with Fisher-z weighting"))
+
+  # C) Replicate × Plate mean heat map
+  print(.plot_panel_means(st))
+}
+
+```
+## Correlation for Replications for only controls
+
+```{r}
+# ============================================================
+# Replicate × Replicate correlations (well-wise) — CONTROLS ONLY
+# 4 subplots (one per site), robust to missing replicates
+# ============================================================
+
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) {
+  warning("Fewer than 4 sites available; plotting what exists.")
+}
+
+# Dominant (mode) label per well; keep only controls
+control_well_keys_for_site <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name, Plate %in% sel_plates) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(Metadata_Compound_type %in% controls) %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::pull(WellKey)
+}
+
+# Compute replicate correlation matrix for a site using ONLY control wells
+replicate_corr_controls_for_site <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  control_keys <- control_well_keys_for_site(site_name)
+
+  per_rep <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Replicate, Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::filter(WellKey %in% control_keys)
+
+  mat_df <- per_rep %>%
+    dplyr::select(WellKey, Replicate, value) %>%
+    tidyr::pivot_wider(names_from = Replicate, values_from = value) %>%
+    dplyr::select(tidyselect::any_of(rep_levels))  # keep R1..R4 order
+
+  n_wells <- nrow(mat_df)
+  n_reps  <- ncol(mat_df)
+  if (n_wells < 2 || n_reps < 2) return(NULL)
+
+  corr <- stats::cor(as.data.frame(mat_df), use = "pairwise.complete.obs", method = "pearson")
+
+  # Prepare outputs (now include FacetLabel here to avoid joins/collisions)
+  facet_label <- sprintf("%s\n(n=%d control wells)", site_name, n_wells)
+
+  out_long <- as.data.frame(as.table(corr)) %>%
+    dplyr::rename(Rep_X = Var1, Rep_Y = Var2, corr = Freq) %>%
+    dplyr::mutate(Metadata_Site = site_name,
+                  n_control_wells = n_wells,
+                  FacetLabel = facet_label)
+
+  offdiag <- corr[upper.tri(corr) | lower.tri(corr)]
+  out_summary <- data.frame(
+    Metadata_Site   = site_name,
+    n_control_wells = n_wells,
+    mean_offdiag    = round(mean(offdiag, na.rm = TRUE), 3),
+    min_offdiag     = round(min(offdiag, na.rm = TRUE), 3),
+    max_offdiag     = round(max(offdiag, na.rm = TRUE), 3),
+    stringsAsFactors = FALSE
+  )
+
+  list(long = out_long, summary = out_summary)
+}
+
+# Run and combine
+res_list   <- lapply(sites_to_plot, replicate_corr_controls_for_site)
+res_list   <- Filter(Negate(is.null), res_list)
+if (length(res_list) == 0) stop("No sites had enough control wells to compute replicate correlations.")
+
+corr_long   <- dplyr::bind_rows(lapply(res_list, `[[`, "long"))
+rep_summary <- dplyr::bind_rows(lapply(res_list, `[[`, "summary"))
+
+# ---- Plot: 4 subplots (one per site), CONTROLS ONLY ----
+p_rep_corr_controls <- ggplot(corr_long, aes(x = Rep_X, y = Rep_Y, fill = corr)) +
+  geom_tile(color = "grey20", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", corr)), size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limits = c(-1, 1), name = "Pearson r") +
+  coord_equal() +
+  facet_wrap(~ FacetLabel, ncol = 2) +
+  labs(
+    title = "Replicate × Replicate Correlation (well-wise) — Controls Only",
+    subtitle = "Each panel is a site; correlations computed across control wells only.",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank(),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_rep_corr_controls)
+
+cat("\n=== Replicate Correlation (Controls Only) — Summary ===\n")
+print(rep_summary)
+
+
+
+```
+
+
+## Correlations for replicates for each compound in `controls`
+
+```{r}
+# ============================================================
+# Replicate × Replicate correlations (well-wise) — by COMPOUND
+# Three plots: one for each compound in `controls`
+# Each plot contains 4 subplots (one per site)
+# ============================================================
+
+# Choose the four sites to display (edit if you want specific ones)
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) {
+  warning("Fewer than 4 sites available; plotting what exists.")
+}
+
+# ---- Helper: dominant (mode) label per well within a site; keep only the target compound ----
+well_keys_for_site_compound <- function(site_name, compound_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name, Plate %in% sel_plates) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Metadata_Compound_type) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(Metadata_Compound_type == compound_name) %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::pull(WellKey)
+}
+
+# ---- Helper: replicate correlation for a (site, compound) using only wells of that compound ----
+replicate_corr_for_site_compound <- function(site_name, compound_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  # wells dominated by the target compound
+  well_keys <- well_keys_for_site_compound(site_name, compound_name)
+
+  per_rep <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Replicate, Plate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(WellKey = sprintf("%s|%s%02d", Plate, Metadata_Row, Metadata_Col)) %>%
+    dplyr::filter(WellKey %in% well_keys)
+
+  mat_df <- per_rep %>%
+    dplyr::select(WellKey, Replicate, value) %>%
+    tidyr::pivot_wider(names_from = Replicate, values_from = value) %>%
+    dplyr::select(tidyselect::any_of(rep_levels))  # keep R1..R4 order if present
+
+  n_wells <- nrow(mat_df); n_reps <- ncol(mat_df)
+  if (n_wells < 2 || n_reps < 2) return(NULL)
+
+  corr <- stats::cor(as.data.frame(mat_df), use = "pairwise.complete.obs", method = "pearson")
+
+  facet_label <- sprintf("%s\n(n=%d wells)", site_name, n_wells)
+
+  out_long <- as.data.frame(as.table(corr)) %>%
+    dplyr::rename(Rep_X = Var1, Rep_Y = Var2, corr = Freq) %>%
+    dplyr::mutate(Metadata_Site = site_name,
+                  Compound = compound_name,
+                  n_wells = n_wells,
+                  FacetLabel = facet_label)
+
+  offdiag <- corr[upper.tri(corr) | lower.tri(corr)]
+  out_summary <- data.frame(
+    Compound   = compound_name,
+    Metadata_Site = site_name,
+    n_wells    = n_wells,
+    mean_offdiag = round(mean(offdiag, na.rm = TRUE), 3),
+    min_offdiag  = round(min(offdiag, na.rm = TRUE), 3),
+    max_offdiag  = round(max(offdiag, na.rm = TRUE), 3),
+    stringsAsFactors = FALSE
+  )
+
+  list(long = out_long, summary = out_summary)
+}
+
+# ---- Make one plot per compound in `controls` ----
+plots_by_compound <- list()
+
+for (cmp in controls) {
+  res_list <- lapply(sites_to_plot, replicate_corr_for_site_compound, compound_name = cmp)
+  res_list <- Filter(Negate(is.null), res_list)
+
+  if (length(res_list) == 0) {
+    message("No sufficient data for compound: ", cmp, " — skipping.")
+    next
+  }
+
+  corr_long   <- dplyr::bind_rows(lapply(res_list, `[[`, "long"))
+  rep_summary <- dplyr::bind_rows(lapply(res_list, `[[`, "summary"))
+
+  p_cmp <- ggplot(corr_long, aes(x = Rep_X, y = Rep_Y, fill = corr)) +
+    geom_tile(color = "grey20", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.2f", corr)), size = 3) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red",
+      midpoint = 0, limits = c(-1, 1), name = "Pearson r"
+    ) +
+    coord_equal() +
+    facet_wrap(~ FacetLabel, ncol = 2) +
+    labs(
+      title = paste0("Replicate × Replicate Correlation (well-wise) — ", cmp),
+      subtitle = "Each panel is a site; wells chosen where this compound is the dominant label.",
+      x = NULL, y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid  = element_blank(),
+      plot.title  = element_text(hjust = 0.5, face = "bold")
+    )
+
+  print(p_cmp)            # <-- Plot 1 (DMSO), Plot 2 (Nocodazole), Plot 3 (Tetrandrine)
+  plots_by_compound[[cmp]] <- p_cmp
+
+  cat("\n=== Replicate Correlation Summary —", cmp, "===\n")
+  print(rep_summary)
+}
+
+
+```
+
+
+## Outlier detect
+
+```{r}
+# ============================================================
+# OUTLIER/BATCH-EFFECT DIAGNOSTICS — replicate-focused
+# Three plots per site:
+#   A) Outlier-rate heat map (4×7)
+#   B) Boxplots per Plate×Replicate (outliers highlighted)
+#   C) Bland–Altman replicate-pairs (color by Plate)
+# ============================================================
+
+# -------- params (tweak as desired) --------
+OUT_Z_THRESH <- 3           # robust z (MAD) threshold for outliers
+USE_LOG_Y    <- TRUE        # boxplot y-axis on log10 scale (often helpful for counts)
+
+# -------- helpers --------
+mad_z <- function(x) {
+  m   <- stats::median(x, na.rm = TRUE)
+  s   <- stats::mad(x, center = m, constant = 1.4826, na.rm = TRUE)  # ~sd if normal
+  if (!is.finite(s) || s <= 0) return((x - m))                       # fallback: mean-centering
+  (x - m) / s
+}
+
+# Per-site: well-level values and outlier flags per Plate×Replicate
+prep_well_data_for_site <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  wells <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Plate, Replicate, Metadata_Row, Metadata_Col) %>%
+    dplyr::summarise(value = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::mutate(
+      PlateColIdx = match(Plate, sel_plates),
+      RepRowIdx   = match(Replicate, rep_levels),
+      WellID      = sprintf("%s%02d", Metadata_Row, Metadata_Col)
+    )
+
+  # robust z & outlier flag *within each Plate×Replicate* distribution (384 wells)
+  wells <- wells %>%
+    dplyr::group_by(Plate, Replicate) %>%
+    dplyr::mutate(
+      z_mad = mad_z(value),
+      is_outlier = abs(z_mad) > OUT_Z_THRESH
+    ) %>%
+    dplyr::ungroup()
+
+  list(wells = wells, sel_plates = sel_plates)
+}
+
+# ========== A) OUTLIER-RATE HEAT MAP (4×7) ==========
+plot_outlier_rate_heatmap <- function(site_name) {
+  prep   <- prep_well_data_for_site(site_name)
+  wells  <- prep$wells
+  plates <- prep$sel_plates
+
+  rates <- wells %>%
+    dplyr::group_by(Plate, Replicate, PlateColIdx, RepRowIdx) %>%
+    dplyr::summarise(
+      n_wells = dplyr::n(),
+      n_out   = sum(is_outlier, na.rm = TRUE),
+      pct_out = 100 * n_out / n_wells,
+      .groups = "drop"
+    )
+
+  # complete 4×7 grid (if missing some panels)
+  grid <- tidyr::expand_grid(
+    PlateColIdx = seq_along(plates),
+    RepRowIdx   = seq_along(rep_levels)
+  ) %>%
+    dplyr::mutate(
+      Plate    = plates[PlateColIdx],
+      Replicate= rep_levels[RepRowIdx]
+    ) %>%
+    dplyr::left_join(rates,
+                     by = c("Plate", "Replicate", "PlateColIdx", "RepRowIdx"))
+
+  ggplot(grid, aes(x = PlateColIdx, y = RepRowIdx, fill = pct_out)) +
+    geom_tile(color = "grey30", linewidth = tile_border_width) +
+    scale_fill_gradient(low = "white", high = "red", na.value = "grey90",
+                        name = "% Outliers") +
+    scale_x_continuous(
+      breaks = seq_along(plates),
+      labels = sprintf("Plate %d\n%s", seq_along(plates), plates),
+      expand = c(0,0)
+    ) +
+    scale_y_continuous(
+      breaks = seq_along(rep_levels),
+      labels = rep_levels,
+      trans = "reverse", expand = c(0,0)
+    ) +
+    coord_fixed() +
+    labs(
+      title    = paste0("Outlier Rate by Plate × Replicate — Site: ", site_name),
+      subtitle = paste0("Robust Z (MAD) with |z| > ", OUT_Z_THRESH,
+                        "; white=0%, red=high outlier rate"),
+      x = NULL, y = "Replicate"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(size = 9)
+    )
+}
+
+# ========== B) BOXPLOTS PER Plate×Rep (outliers highlighted) ==========
+plot_boxplots_plate_rep <- function(site_name) {
+  prep   <- prep_well_data_for_site(site_name)
+  wells  <- prep$wells
+  plates <- prep$sel_plates
+
+  wells$Plate <- factor(wells$Plate, levels = plates)
+
+  p <- ggplot(wells, aes(x = Plate, y = value)) +
+    geom_boxplot(outlier.shape = NA, fill = "grey90", color = "grey40") +
+    # highlight outliers in red
+    geom_point(
+      data = wells %>% dplyr::filter(is_outlier),
+      aes(x = Plate, y = value),
+      color = "red", alpha = 0.6, size = 0.8, position = position_jitter(width = 0.15, height = 0)
+    ) +
+    { if (USE_LOG_Y) scale_y_log10() else ggplot2::scale_y_continuous() } +
+    facet_grid(Replicate ~ ., switch = "y") +
+    labs(
+      title = paste0("Well Count Distributions per Plate — Site: ", site_name),
+      subtitle = paste0("Outliers (|z| > ", OUT_Z_THRESH, ") marked in red; ",
+                        if (USE_LOG_Y) "log10 scale" else "linear scale"),
+      x = "Plate", y = "Cell count"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.text = element_text(face = "bold")
+    )
+
+  p
+}
+
+# ========== C) BLAND–ALTMAN (replicate pairs), color by Plate ==========
+plot_bland_altman <- function(site_name) {
+  p_order    <- plate_order_for_site(site_name)
+  sel_plates <- head(p_order, plates_per_site)
+
+  wide <- df_parsed %>%
+    dplyr::filter(Metadata_Site == site_name,
+                  Plate %in% sel_plates,
+                  Replicate %in% rep_levels) %>%
+    dplyr::group_by(Plate, Metadata_Row, Metadata_Col, Replicate) %>%
+    dplyr::summarise(val = mean(Metadata_Object_Count, na.rm = TRUE),
+                     .groups = "drop") %>%
+    tidyr::unite("WellKey", Plate, Metadata_Row, Metadata_Col, sep = "|", remove = FALSE) %>%
+    tidyr::pivot_wider(names_from = Replicate, values_from = val) %>%
+    dplyr::mutate(Plate = factor(Plate, levels = sel_plates))
+
+  # all replicate pairs
+  pairs <- combn(intersect(colnames(wide), rep_levels), 2, simplify = FALSE)
+
+  ba <- purrr::map_dfr(pairs, function(pr) {
+    r1 <- pr[1]; r2 <- pr[2]
+    d  <- wide %>%
+      dplyr::select(Plate, {{ r1 }}, {{ r2 }}) %>%
+      dplyr::rename(v1 = !!r1, v2 = !!r2) %>%
+      dplyr::filter(is.finite(v1) | is.finite(v2)) %>%
+      dplyr::mutate(
+        mean12 = (v1 + v2) / 2,
+        diff12 = v1 - v2,
+        Pair   = paste0(r1, " vs ", r2)
+      )
+    d
+  })
+
+  if (nrow(ba) == 0) return(ggplot() + theme_void())
+
+  # limits of agreement (per pair)
+  loas <- ba %>%
+    dplyr::group_by(Pair) %>%
+    dplyr::summarise(
+      mu = mean(diff12, na.rm = TRUE),
+      sd = stats::sd(diff12, na.rm = TRUE),
+      loa_low  = mu - 1.96 * sd,
+      loa_high = mu + 1.96 * sd,
+      .groups = "drop"
+    )
+
+  ggplot(ba, aes(x = mean12, y = diff12, color = Plate)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    # add LOA bands per panel
+    ggplot2::geom_hline(
+      data = loas, aes(yintercept = loa_low), linetype = "dotted", inherit.aes = FALSE
+    ) +
+    ggplot2::geom_hline(
+      data = loas, aes(yintercept = loa_high), linetype = "dotted", inherit.aes = FALSE
+    ) +
+    geom_point(alpha = 0.5, size = 0.7) +
+    facet_wrap(~ Pair, ncol = 3, scales = "free_x") +
+    labs(
+      title = paste0("Bland–Altman by Replicate Pair — Site: ", site_name),
+      subtitle = "Points colored by Plate; dashed line = 0, dotted = ±1.96 SD of differences",
+      x = "Mean of two replicates", y = "Difference (rep1 − rep2)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+# =========================
+# RUN for 4 sites (or whatever you have)
+# =========================
+sites_to_plot <- sort(unique(df_parsed$Metadata_Site))[1:4]
+if (length(sites_to_plot) < 4) warning("Fewer than 4 sites available; running on available sites.")
+
+for (st in sites_to_plot) {
+  # A) Outlier-rate heat map
+  print(plot_outlier_rate_heatmap(st))
+  # B) Boxplots highlighting outliers
+  print(plot_boxplots_plate_rep(st))
+  # C) Bland–Altman with plate colors
+  print(plot_bland_altman(st))
+}
+
+```
