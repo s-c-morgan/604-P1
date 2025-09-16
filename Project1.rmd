@@ -240,7 +240,7 @@ make_missing_plot <- function(site_name) {
     ) +
     labs(
       title    = paste0("Missingness — Site: ", site_name, " (4 Replicates × 7 Plates)"),
-      subtitle = "Red = Missing, White = Observe.",
+      subtitle = "Red = Missing, White = Observed",
       x = "Column", y = "Row"
     ) +
     theme_minimal(base_size = 12) +
